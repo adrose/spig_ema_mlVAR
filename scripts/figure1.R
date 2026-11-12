@@ -9,7 +9,7 @@ library(ggpubr)
 # ============================================================================
 # LOAD AND PROCESS RAW DATA
 # ============================================================================
-
+setwd("~/Documents/spig_ema_mlVAR/")
 in_dat <- read_xlsx("./data/SPIG EMA updated data.xlsx")
 in_dat$Response[which(in_dat$Response == "#skipped#")] <- NA
 
@@ -72,11 +72,9 @@ all_data <- all_data[!all_data$ID %in% c(76826), ]
 ## First remove all NA observation counts
 all_data = all_data[-which(is.na(all_data$Session.Instance.No)),]
 
-
 # ============================================================================
 # RENAME COLUMNS FOR EASIER HANDLING
 # ============================================================================
-
 colnames(all_data) <- c("time_col", "SessionNumb", "id", "ADHD",
                         "item1", "item2", "item3", "item4",
                         "item5", "item6", "item7", "item8",
@@ -85,7 +83,6 @@ colnames(all_data) <- c("time_col", "SessionNumb", "id", "ADHD",
 # ============================================================================
 # CALCULATE TIME INTERVALS AND PROCESS
 # ============================================================================
-
 ema_data <- all_data %>%
   rename(ID = id) %>%
   group_by(ID) %>%
@@ -113,6 +110,20 @@ ema_data <- all_data %>%
          item1, item2, item3, item4, item5, item6, item7, item8,
          Alone, SocialMedia, InPerson, ADHD, SessionNumb)
 
+## Create the varaince covaraince matrices
+# Polychoric
+out_polycor = psych::polychoric(ema_data[,c(5:12)])$rho
+# Raw correlation
+out_cor = cor(ema_data[,c(5:12)])
+# covar mat
+out_cov = var(ema_data[,c(5:12)])
+# item descriptives
+item_desc = psych::describe(ema_data[,c(5:12)])
+write.csv(out_polycor, file = "./data/polycor_mat.csv", quote = F, row.names=F)
+write.csv(out_cor, file = "./data/cor_mat.csv", quote = F, row.names=F)
+write.csv(out_cov, file = "./data/cov_mat.csv", quote = F, row.names=F)
+write.csv(item_desc, file = "./data/descrip.csv", quote = F, row.names=T)
+
 ## Now calculate reliability following: Nezlek 2016
 rel_dat <- ema_data %>%
   group_by(ID) %>%
@@ -137,11 +148,44 @@ mod_rel2 = lmer(value ~ 1 + (1|ID) + (1|occasion) + (1|item), data = rel_dat[whi
 item_rel2 = VarCorr(mod_rel2)$occasion[1] / (VarCorr(mod_rel2)$occasion[1] + (VarCorr(mod_rel2)$item[1] / 4))
 print(item_rel2)
 
+## Now try the G throy appraoch
+model1 = lmer(value ~ 1 + (1|ID) + 
+                  (1|occasion) + 
+                  (1|item) +
+                  (1|ID:occasion) +
+                  (1|ID:item) +
+                  (1|item:occasion), data = rel_dat[which(rel_dat$item %in% paste("item", 1:4, sep='')),])
+
+(personTime <- VarCorr(model1)[[1]][1,1]) #person:time 
+(personItem <- VarCorr(model1)[[2]][1,1]) #person:item 
+(person <- VarCorr(model1)[[3]][1,1]) #person 
+(timeItem <- VarCorr(model1)[[4]][1,1]) #time:item 
+(time <- VarCorr(model1)[[5]][1,1]) #time 
+(item <- VarCorr(model1)[[6]][1,1]) #item 
+(residual <- sigma(model1)^2) #residual
+k <- 4
+(Rc <- personTime/(personTime + residual/k))
+
+model1 = lmer(value ~ 1 + (1|ID) + 
+                (1|occasion) + 
+                (1|item) +
+                (1|ID:occasion) +
+                (1|ID:item) +
+                (1|item:occasion), data = rel_dat[which(!rel_dat$item %in% paste("item", 1:4, sep='')),])
+
+personTime <- VarCorr(model1)[[1]][1,1] #person:time 
+personItem <- VarCorr(model1)[[2]][1,1] #person:item 
+person <- VarCorr(model1)[[3]][1,1] #person 
+timeItem <- VarCorr(model1)[[4]][1,1] #time:item 
+time <- VarCorr(model1)[[5]][1,1] #time 
+item <- VarCorr(model1)[[6]][1,1] #item 
+residual <- sigma(model1)^2 #residual
+k <- 4
+(Rc <- personTime/(personTime + residual/k))
 
 # ============================================================================
 # CALCULATE ITEM-LEVEL VARIANCE FOR EACH PARTICIPANT
 # ============================================================================
-
 person_item_variance <- ema_data %>%
   select(ID, ADHD, item1:item8) %>%
   group_by(ID, ADHD) %>%
@@ -211,14 +255,6 @@ person_item_variance <- ema_data %>%
   )
 
 # ============================================================================
-# COMPARE RESPONSE RATES
-# ============================================================================
-# source("~/GitHub/adroseHelperScripts/R/afgrHelpFunc.R")
-# rr_data = for_mod[!duplicated(for_mod$ID),]
-# t.test(n_obs ~ ADHD, data = rr_data)
-# summarySE(data = rr_data, measurevar = "n_obs", groupvars = "ADHD")
-
-# ============================================================================
 # EXAMINE PREDICTORS OF VARAINCE
 # ============================================================================
 library(visreg)
@@ -228,7 +264,9 @@ for_mod = for_mod[which(for_mod$variable %in% c("var_item1", "var_item2", "var_i
                                                 "var_item5", "var_item6", "var_item7", "var_item8")),]
 for_mod$value = as.numeric(for_mod$value)
 mod = lmer(value ~ (ADHD + n_obs + variable)^3 + (1 | ID), data = for_mod)
-mod_b = brm(value ~ (ADHD + n_obs + variable)^3 + (1 | ID), data = for_mod, warmup = 2000, iter = 4000)
+mod_b = brm(value ~ (ADHD + n_obs + variable)^3 + (1 | ID), data = for_mod, 
+            warmup = 2000, iter = 4000,
+            backend = "cmdstanr", cores = 4)
 car::Anova(mod)
 visreg(mod, "ADHD", "variable", gg=TRUE) + theme_minimal()
 conditional_effects(mod_b, effects = "ADHD:variable")
@@ -239,8 +277,18 @@ for_mod = for_mod[which(for_mod$variable %in% c("mean_item1", "mean_item2", "mea
                                                 "mean_item5", "mean_item6", "mean_item7", "mean_item8")),]
 for_mod$value = as.numeric(for_mod$value)
 mod = lmer(value ~ (ADHD + n_obs + variable)^3 + (1 | ID), data = for_mod)
-mod_b = brm(value ~ (ADHD + n_obs + variable)^3 + (1 | ID), data = for_mod, warmup = 2000, iter = 4000)
+mod_b = brm(value ~ (ADHD + n_obs + variable)^3 + (1 | ID), 
+            data = for_mod, warmup = 2000, iter = 4000,
+            backend = "cmdstanr", cores = 4)
 car::Anova(mod)
+
+# ============================================================================
+# COMPARE RESPONSE RATES
+# ============================================================================
+source("~/Documents/adroseHelperScripts/R/afgrHelpFunc.R")
+rr_data = for_mod[!duplicated(for_mod$ID),]
+t.test(n_obs ~ ADHD, data = rr_data)
+summarySE(data = rr_data, measurevar = "n_obs", groupvars = "ADHD")
 
 # ============================================================================
 # FIGURE: GROUP DIFFERENCES IN ITEM-LEVEL MEAN AND VARIANCE
@@ -434,3 +482,58 @@ ggsave("./Figure1_ItemLevel_Mean_Variance.png",
        height = 8,
        dpi    = 300,
        bg     = "white")
+
+
+# ============================================================================
+# Now run models including other covars of interest
+# ============================================================================
+time_invar <- ema_data %>%
+  group_by(ID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(ID, ADHD) %>%
+  mutate(ADHD_numeric = ifelse(ADHD == "Y", 1, 0))
+
+time_invar$ADHD_numeric[is.na(time_invar$ADHD_numeric)] <- 0
+## Now add the other assessments of pathology here too
+add_covar = in_dat <- read_xlsx(
+  "./data/possible covariates .xlsx"
+)
+spig_key = read_csv("./data/spig_id_key.csv")
+
+## Now merge
+colnames(add_covar)[1] = "SPIG_ID"
+colnames(spig_key) = c("ID", "SPIG_ID")
+add_covar = merge(spig_key, add_covar)
+time_invar = merge(time_invar, add_covar, by = "ID")
+## Now merge back to mean and var data
+person_item_variance_SP = merge(person_item_variance, time_invar)
+
+# ============================================================================
+# EXAMINE PREDICTORS OF VARAINCE
+# ============================================================================
+library(janitor)
+# RESHAPE FOR LMER MODEL
+for_mod = reshape2::melt(person_item_variance_SP, id.vars = c("ID", "ADHD", "n_obs", "C SCARED Score", "DBD Cp Scr"))
+for_mod = for_mod[which(for_mod$variable %in% c("var_item1", "var_item2", "var_item3", "var_item4",
+                                                "var_item5", "var_item6", "var_item7", "var_item8")),]
+for_mod$value = as.numeric(for_mod$value)
+for_mod = janitor::clean_names(for_mod)
+mod = lmer(value ~ (adhd + n_obs + variable)^3 + c_scared_score * dbd_cp_scr +(1 | id), data = for_mod)
+mod_b = brm(value ~ (adhd + n_obs + variable)^3 + c_scared_score * dbd_cp_scr +(1 | id), 
+            data = for_mod, warmup = 2000, iter = 4000, backend = "cmdstanr", cores = 4)
+car::Anova(mod)
+visreg(mod, "adhd", "variable", gg=TRUE) + theme_minimal()
+conditional_effects(mod_b, effects = "adhd:variable")
+
+## Now do means
+for_mod = reshape2::melt(person_item_variance_SP, id.vars = c("ID", "ADHD", "n_obs", "C SCARED Score", "DBD Cp Scr"))
+for_mod = for_mod[which(for_mod$variable %in% c("mean_item1", "mean_item2", "mean_item3", "mean_item4",
+                                                "mean_item5", "mean_item6", "mean_item7", "mean_item8")),]
+for_mod$value = as.numeric(for_mod$value)
+for_mod = janitor::clean_names(for_mod)
+mod = lmer(value~ (adhd + n_obs + variable)^3 + c_scared_score * dbd_cp_scr +(1 | id), data = for_mod)
+mod_b = brm(value~ (adhd + n_obs + variable)^3 + c_scared_score * dbd_cp_scr +(1 | id), 
+            data = for_mod, warmup = 2000, iter = 4000, backend = "cmdstanr", cores = 4)
+car::Anova(mod)
+
