@@ -1,3 +1,4 @@
+setwd("~/Documents/spig_ema_mlVAR/")
 # ============================================================================
 # 1. LOAD LIBRARIES
 # ============================================================================
@@ -13,6 +14,7 @@ library(patchwork)
 library(ggdist)
 library(bayesplot)
 library(ggpubr)
+library(broom)
 
 # ============================================================================
 # 2. LOAD RAW DATA
@@ -139,12 +141,6 @@ rep_diff_long <- all_data %>%
   ) %>%
   mutate(item = as.numeric(item))
 
-## Now run a glmer testing for temporal response pattern differences
-#mod_rep1 = brm(responded ~ item + RawHours * ADHD + (1 + RawHours|ID), data = rep_diff_long, cores = 4)
-#mod_rep2 = brm(responded ~ item + s(RawHours) + ADHD + (1 + RawHours|ID), data = rep_diff_long)
-mod_rep1P = lme4::glmer(responded ~ item + RawHours * ADHD + (1 + RawHours|ID), data = rep_diff_long)
-#mod_rep1P = mgcv::gamm(responded ~ item + s(RawHours) + s(RawHours, by = ADHD), data = rep_diff_long, family="binomial")
-
 # ============================================================================
 # 6. COMPUTE TIME, SESSIONS (30-HOUR GAP RULE), AND BASIC VARIABLES
 # ============================================================================
@@ -257,7 +253,6 @@ session_summary <- ema_data %>%
 # ============================================================================
 # 9. COMPUTE MEAN SCORE
 # ============================================================================
-
 ema_data <- ema_data %>%
   mutate(
     anti_mean = rowMeans(cbind(item1, item2, item3, item4), na.rm = TRUE),
@@ -278,9 +273,6 @@ ema_data <- ema_data %>%
     Y2 = (pro_mean  - pro_gm)  / pro_sd_global
   )
 
-cat(sprintf("  Grand means: anti=%.3f, pro=%.3f\n", anti_gm, pro_gm))
-
-
 # ============================================================================
 # 10. PROCESS BINARY SOCIAL CONTEXT INDICATORS
 # ============================================================================
@@ -294,18 +286,257 @@ for (vname in context_vars) {
 }
 
 # ---- Context frequency table ----
-all_endorse = ema_data %>%
-  count(Alone, SocialMedia, InPerson, name = "n") %>%
-  arrange(desc(n)) %>%
-  mutate(pct = round(100 * n / sum(n), 1)) %>%
-  print()
+# 1. Total N per ADHD group for denominators
+group_totals <- ema_data %>%
+  count(ADHD, name = "total_n")
 
-ema_data %>%
-  group_by(ADHD) |> 
-  count(Alone, SocialMedia, InPerson, name = "n") %>%
-  arrange(ADHD, desc(n)) %>%
-  mutate(pct = round(100 * n / sum(n), 1))
+# 2. Part A: Single Endorsements
+ema_single_long <- ema_data %>%
+  pivot_longer(
+    cols = c(Alone, SocialMedia, InPerson),
+    names_to = "Category",
+    values_to = "Endorsed"
+  )
 
+single_counts <- ema_single_long %>%
+  filter(Endorsed == 1 | Endorsed == TRUE) %>%
+  group_by(Category, ADHD) %>%
+  summarise(n_endorsed = n(), .groups = "drop")
+
+single_chi <- ema_single_long %>%
+  group_by(Category) %>%
+  summarise(test = list(chisq.test(table(ADHD, Endorsed))), .groups = "drop") %>%
+  mutate(tidy_test = map(test, broom::tidy)) %>%
+  unnest(tidy_test) %>%
+  select(Category, statistic, parameter, p.value)
+
+# 3. Part B: Double Co-Endorsements
+ema_doubles <- ema_data %>%
+  mutate(
+    `Alone + Social Media`     = as.numeric(Alone == 1 & SocialMedia == 1 & InPerson == 0),
+    `Alone + In-Person`        = as.numeric(Alone == 1 & SocialMedia == 0 & InPerson == 1),
+    `Social Media + In-Person` = as.numeric(Alone == 0 & SocialMedia == 1 & InPerson == 1)
+  )
+
+ema_doubles_long <- ema_doubles %>%
+  pivot_longer(
+    cols = c(`Alone + Social Media`, `Alone + In-Person`, `Social Media + In-Person`),
+    names_to = "Category",
+    values_to = "Endorsed"
+  )
+
+double_counts <- ema_doubles_long %>%
+  filter(Endorsed == 1 | Endorsed == TRUE) %>%
+  group_by(Category, ADHD) %>%
+  summarise(n_endorsed = n(), .groups = "drop")
+
+double_chi <- ema_doubles_long %>%
+  group_by(Category) %>%
+  summarise(test = list(chisq.test(table(ADHD, Endorsed))), .groups = "drop") %>%
+  mutate(tidy_test = map(test, broom::tidy)) %>%
+  unnest(tidy_test) %>%
+  select(Category, statistic, parameter, p.value)
+
+# 4. Part C: Triple Co-Endorsement & None
+ema_extremes <- ema_data %>%
+  mutate(
+    `All Three` = as.numeric(Alone == 1 & SocialMedia == 1 & InPerson == 1),
+    `None`      = as.numeric(Alone == 0 & SocialMedia == 0 & InPerson == 0)
+  )
+
+ema_extremes_long <- ema_extremes %>%
+  pivot_longer(
+    cols = c(`All Three`, `None`),
+    names_to = "Category",
+    values_to = "Endorsed"
+  )
+
+extreme_counts <- ema_extremes_long %>%
+  filter(Endorsed == 1 | Endorsed == TRUE) %>%
+  group_by(Category, ADHD) %>%
+  summarise(n_endorsed = n(), .groups = "drop")
+
+extreme_chi <- ema_extremes_long %>%
+  group_by(Category) %>%
+  summarise(test = list(chisq.test(table(ADHD, Endorsed))), .groups = "drop") %>%
+  mutate(tidy_test = map(test, broom::tidy)) %>%
+  unnest(tidy_test) %>%
+  select(Category, statistic, parameter, p.value)
+
+# 5. Combine All Parts into a Single Table
+combined_counts <- bind_rows(single_counts, double_counts, extreme_counts)
+combined_chi <- bind_rows(single_chi, double_chi, extreme_chi)
+
+# Define custom row order for clean presentation
+category_order <- c(
+  "Alone", "SocialMedia", "InPerson",
+  "Alone + Social Media", "Alone + In-Person", "Social Media + In-Person",
+  "All Three", "None"
+)
+
+final_complete_table <- combined_counts %>%
+  left_join(group_totals, by = "ADHD") %>%
+  mutate(
+    pct = round(100 * n_endorsed / total_n, 1),
+    n_pct = sprintf("%d (%.1f%%)", n_endorsed, pct)
+  ) %>%
+  select(Category, ADHD, n_pct) %>%
+  pivot_wider(
+    names_from = ADHD,
+    values_from = n_pct,
+    names_prefix = "ADHD_"
+  ) %>%
+  left_join(combined_chi, by = "Category") %>%
+  mutate(
+    statistic = round(statistic, 2),
+    p.value = case_when(
+      p.value < 0.001 ~ "< 0.001",
+      TRUE ~ as.character(round(p.value, 3))
+    ),
+    Category = factor(Category, levels = category_order)
+  ) %>%
+  arrange(Category) %>%
+  rename(
+    `Endorsement / Co-Endorsement Category` = Category,
+    `Chi-Square` = statistic,
+    `df` = parameter,
+    `p-value` = p.value
+  )
+
+# Print Final Summary Table
+print(final_complete_table)
+write.csv(final_complete_table, file = "./data/social_endorse_cat.csv", quote=FALSE)
+
+
+##---- weekend by context ----------------
+#make weekend varaible
+ema_data = ema_data |> 
+  mutate(dt_obj = as.POSIXlt(time_col, tz = "UTC"),
+         weekend = as.integer(dt_obj$wday %in% c(0, 6)))
+
+# 1. Total N per ADHD group for denominators
+group_totals <- ema_data %>%
+  count(weekend, name = "total_n")
+
+# 2. Part A: Single Endorsements
+ema_single_long <- ema_data %>%
+  pivot_longer(
+    cols = c(Alone, SocialMedia, InPerson),
+    names_to = "Category",
+    values_to = "Endorsed"
+  )
+
+single_counts <- ema_single_long %>%
+  filter(Endorsed == 1 | Endorsed == TRUE) %>%
+  group_by(Category, weekend) %>%
+  summarise(n_endorsed = n(), .groups = "drop")
+
+single_chi <- ema_single_long %>%
+  group_by(Category) %>%
+  summarise(test = list(chisq.test(table(weekend, Endorsed))), .groups = "drop") %>%
+  mutate(tidy_test = map(test, broom::tidy)) %>%
+  unnest(tidy_test) %>%
+  select(Category, statistic, parameter, p.value)
+
+# 3. Part B: Double Co-Endorsements
+ema_doubles <- ema_data %>%
+  mutate(
+    `Alone + Social Media`     = as.numeric(Alone == 1 & SocialMedia == 1 & InPerson == 0),
+    `Alone + In-Person`        = as.numeric(Alone == 1 & SocialMedia == 0 & InPerson == 1),
+    `Social Media + In-Person` = as.numeric(Alone == 0 & SocialMedia == 1 & InPerson == 1)
+  )
+
+ema_doubles_long <- ema_doubles %>%
+  pivot_longer(
+    cols = c(`Alone + Social Media`, `Alone + In-Person`, `Social Media + In-Person`),
+    names_to = "Category",
+    values_to = "Endorsed"
+  )
+
+double_counts <- ema_doubles_long %>%
+  filter(Endorsed == 1 | Endorsed == TRUE) %>%
+  group_by(Category, weekend) %>%
+  summarise(n_endorsed = n(), .groups = "drop")
+
+double_chi <- ema_doubles_long %>%
+  group_by(Category) %>%
+  summarise(test = list(chisq.test(table(weekend, Endorsed))), .groups = "drop") %>%
+  mutate(tidy_test = map(test, broom::tidy)) %>%
+  unnest(tidy_test) %>%
+  select(Category, statistic, parameter, p.value)
+
+# 4. Part C: Triple Co-Endorsement & None
+ema_extremes <- ema_data %>%
+  mutate(
+    `All Three` = as.numeric(Alone == 1 & SocialMedia == 1 & InPerson == 1),
+    `None`      = as.numeric(Alone == 0 & SocialMedia == 0 & InPerson == 0)
+  )
+
+ema_extremes_long <- ema_extremes %>%
+  pivot_longer(
+    cols = c(`All Three`, `None`),
+    names_to = "Category",
+    values_to = "Endorsed"
+  )
+
+extreme_counts <- ema_extremes_long %>%
+  filter(Endorsed == 1 | Endorsed == TRUE) %>%
+  group_by(Category, weekend) %>%
+  summarise(n_endorsed = n(), .groups = "drop")
+
+extreme_chi <- ema_extremes_long %>%
+  group_by(Category) %>%
+  summarise(test = list(chisq.test(table(weekend, Endorsed))), .groups = "drop") %>%
+  mutate(tidy_test = map(test, broom::tidy)) %>%
+  unnest(tidy_test) %>%
+  select(Category, statistic, parameter, p.value)
+
+# 5. Combine All Parts into a Single Table
+combined_counts <- bind_rows(single_counts, double_counts, extreme_counts)
+combined_chi <- bind_rows(single_chi, double_chi, extreme_chi)
+
+# Define custom row order for clean presentation
+category_order <- c(
+  "Alone", "SocialMedia", "InPerson",
+  "Alone + Social Media", "Alone + In-Person", "Social Media + In-Person",
+  "All Three", "None"
+)
+
+final_complete_table <- combined_counts %>%
+  left_join(group_totals, by = "weekend") %>%
+  mutate(
+    pct = round(100 * n_endorsed / total_n, 1),
+    n_pct = sprintf("%d (%.1f%%)", n_endorsed, pct)
+  ) %>%
+  select(Category, weekend, n_pct) %>%
+  pivot_wider(
+    names_from = weekend,
+    values_from = n_pct,
+    names_prefix = "weekend_"
+  ) %>%
+  left_join(combined_chi, by = "Category") %>%
+  mutate(
+    statistic = round(statistic, 2),
+    p.value = case_when(
+      p.value < 0.001 ~ "< 0.001",
+      TRUE ~ as.character(round(p.value, 3))
+    ),
+    Category = factor(Category, levels = category_order)
+  ) %>%
+  arrange(Category) %>%
+  rename(
+    `Endorsement / Co-Endorsement Category` = Category,
+    `Chi-Square` = statistic,
+    `df` = parameter,
+    `p-value` = p.value
+  )
+
+# Print Final Summary Table
+print(final_complete_table)
+write.csv(final_complete_table, file = "./data/social_endorse_cat_weekend.csv", quote=FALSE)
+
+
+## Now plot these endorse patterns
 plot_data <- ema_data %>%
   mutate(
     Endorsement = case_when(
@@ -370,14 +601,22 @@ ggplot(plot_data, aes(x = Endorsement, y = pct, fill = Endorsement)) +
 ## First isolate the data
 iso_vals = ema_data |> 
   dplyr::select(ID, ADHD, Alone, SocialMedia, InPerson, day_of_week, time_of_day) |> 
+  dplyr::mutate(day_of_week = substr(day_of_week, 1, 2)) |>
   pivot_longer(
     cols = c(Alone, SocialMedia, InPerson),
     names_to = "endorse",
     values_to = "value"
   )
+
 ## Convert time to numeric
 iso_vals$time_period = hms(iso_vals$time_of_day)
 iso_vals$hours_numeric <- scale(as.numeric(iso_vals$time_period, "hours"))[,]
-## Now run spline on time and interactions on other variables
-mod_est = brm(value ~ endorse + day_of_week + ADHD + s(hours_numeric) + (1 + endorse | ID), 
-              data = iso_vals, family = bernoulli(link = "logit"))
+
+# ============================================================================
+# 11. GROUP TEMPORAL DIFFERENCES MODEL
+# ============================================================================
+## Now run spline on time and interactions on other variables?
+mod_est_linear = brm(value ~ (endorse + day_of_week + ADHD + hours_numeric)^4 + (1 + endorse | ID), 
+              data = iso_vals, family = bernoulli(link = "logit"),
+              chains = 4, cores = 4, backend = "cmdstanr", 
+              file = "./data/mod_est_endorse.RDS")
