@@ -113,6 +113,7 @@ all_data <- all_data %>%
 # ============================================================================
 # 5b. Create response pattern diff data
 # ============================================================================
+SESSION_GAP_HOURS = 30
 rep_diff_long <- all_data %>%
   rename(ID = id) %>%
   mutate(
@@ -144,16 +145,23 @@ rep_diff_long <- all_data %>%
   mutate(item = as.numeric(item))
 
 ## Now run a glmer testing for temporal response pattern differences
-#mod_rep1 = brm(responded ~ item + RawHours * ADHD + (1 + RawHours|ID), data = rep_diff_long, cores = 4)
+## Scale before estimation
+rep_diff_long$RawHours_s = scale(rep_diff_long$RawHours)[,]
+rep_diff_long$item = factor(rep_diff_long$item)
+mod_rep1 = brm(responded ~ item + RawHours_s * ADHD + weekend + (1 + RawHours_s|ID), 
+               data = rep_diff_long, cores = 4, backend = "cmdstanr", family = "bernoulli",
+               file = "./data/missingLogitModel.rds")
+## Write summary table
+write.csv(round(summary(mod_rep1)$fixed,2), file = "./data/out_endorse_table.csv", quote = F, row.names = T)
+
 #mod_rep2 = brm(responded ~ item + s(RawHours) + ADHD + (1 + RawHours|ID), data = rep_diff_long)
-mod_rep1P = lme4::glmer(responded ~ item + RawHours * ADHD + (1 + RawHours|ID), data = rep_diff_long)
-mod_rep1P = mgcv::gamm(responded ~ item + s(RawHours) + s(RawHours, by = ADHD), data = rep_diff_long, family="binomial")
+mod_rep1P = lme4::glmer(responded ~ item + RawHours_s * ADHD + weekend + (1 + RawHours_s|ID),
+                        data = rep_diff_long, family = "binomial")
+#mod_rep1P = gamm(responded ~ item + s(RawHours) + ADHD + s(RawHours, by = "item"), data = rep_diff_long, family="binomial")
 
 # ============================================================================
 # 6. COMPUTE TIME, SESSIONS (30-HOUR GAP RULE), AND BASIC VARIABLES
 # ============================================================================
-SESSION_GAP_HOURS <- 30
-
 ema_data <- all_data %>%
   rename(ID = id) %>%
   mutate(across(item1:item8, as.numeric),
@@ -205,9 +213,9 @@ time_invar <- ema_data %>%
 time_invar$ADHD_numeric[is.na(time_invar$ADHD_numeric)] <- 0
 ## Now add the other assessments of pathology here too
 add_covar = in_dat <- read_xlsx(
-  "./data/pennStateEMAAnalyses/ADHD analyses R21/possible covariates .xlsx"
+  "./data/possible covariates .xlsx"
 )
-spig_key = read_csv("./data/pennStateEMAAnalyses/ADHD analyses R21/spig_id_key.csv")
+spig_key = read_csv("./data/spig_id_key.csv")
 
 ## Now merge
 colnames(add_covar)[1] = "SPIG_ID"
@@ -270,6 +278,21 @@ ema_data <- ema_data %>%
     pro_mean  = ifelse(is.nan(pro_mean),  NA_real_, pro_mean)
   )
 
+ema_data_with_counts <- ema_data %>%
+  mutate(
+    # Count how many items are missing in the anti scale (item1 to item4)
+    missing_anti = rowSums(is.na(select(., item1:item4))),
+    
+    # Count how many items are missing in the pro scale (item5 to item8)
+    missing_pro  = rowSums(is.na(select(., item5:item8))),
+    
+    # Count total missing items across all 8 items combined
+    missing_total = rowSums(is.na(select(., item1:item8)))
+  )
+
+# To see a breakdown/frequency table of how many observations have 0, 1, 2, etc. missing items:
+table(ema_data_with_counts$missing_total)
+
 # Grand-mean center and standard
 anti_gm        <- mean(ema_data$anti_mean, na.rm = TRUE)
 pro_gm         <- mean(ema_data$pro_mean,  na.rm = TRUE)
@@ -314,8 +337,8 @@ if (!"ADHD_numeric" %in% names(ema_data)) {
   ema_data$ADHD_numeric[is.na(ema_data$ADHD_numeric)] <- 0
 }
 
-interaction_td_names <- paste0("ADHD_x_", base_td_names)
-
+interaction_td_names <- paste0("ADHD_x_", context_vars)
+base_td_names = context_vars
 for (k in seq_along(base_td_names)) {
   ema_data[[interaction_td_names[k]]] <-
     as.integer(ema_data$ADHD_numeric * ema_data[[base_td_names[k]]])
@@ -444,29 +467,32 @@ final_dt_check <- ema_data %>%
 # ============================================================================
 # 13. PREPARE brms DATA
 # ============================================================================
-
 brms_dat <- ema_data %>%
   group_by(ID) %>%
   mutate(
     Y1_pm = mean(Y1, na.rm = TRUE),
     Y2_pm = mean(Y2, na.rm = TRUE),
     Y1_wc = Y1 - Y1_pm,
-    Y2_wc = Y2 - Y2_pm
+    Y2_wc = Y2 - Y2_pm,
+    ## Now make the person centered binary social indicator variables
+    alone_pm = mean(Alone, na.rm = TRUE),
+    socia_pm = mean(SocialMedia, na.rm = TRUE),
+    inper_pm = mean(InPerson, na.rm = TRUE),
+    alone_wc = Alone - alone_pm,
+    socia_wc = SocialMedia - socia_pm,
+    inper_wc = InPerson - inper_pm
   ) %>%
-  ungroup()
-
+  ungroup() |>
   arrange(ctsem_id, ctsem_time) %>%
   group_by(ctsem_id) %>%
   mutate(
     # ── Lags of within-centered scores (pure within-person dynamics) ─────
     Y1_lag_wc = lag(Y1_wc),
     Y2_lag_wc = lag(Y2_wc),
-    
     # ── Person-mean lags (between-person level control; constant within
-    #    person but needs to exist on lag rows) ────────────────────────────
+    # person but needs to exist on lag rows) ────────────────────────────
     Y1_pm_lag = lag(Y1_pm),
     Y2_pm_lag = lag(Y2_pm),
-    
     # ── Time interval ────────────────────────────────────────────────────
     dt = ctsem_time - lag(ctsem_time)
   ) %>%
@@ -478,14 +504,18 @@ brms_dat <- ema_data %>%
     dt > 0
   ) %>%
   mutate(
-    log_dt    = log(dt),
+    log_dt = log(dt),
     person_id = factor(ID),
-    ADHD_x_Y1_lag  = ADHD_numeric * Y1_lag_wc,
-    ADHD_x_Y2_lag  = ADHD_numeric * Y2_lag_wc,
+    ADHD_x_Y1_lag = ADHD_numeric * Y1_lag_wc,
+    ADHD_x_Y2_lag = ADHD_numeric * Y2_lag_wc,
     ADHD_x_SocialMedia = ADHD_numeric * SocialMedia,
-    ADHD_x_InPerson    = ADHD_numeric * InPerson,
-    ADHD_x_Alone       = ADHD_numeric * Alone,
-    ADHD_x_weekend     = ADHD_numeric * weekend,
+    ADHD_x_InPerson = ADHD_numeric * InPerson,
+    ADHD_x_Alone = ADHD_numeric * Alone,
+    ADHD_x_weekend = ADHD_numeric * weekend,
+    ADHD_x_SocialMediawc = ADHD_numeric * socia_wc,
+    ADHD_x_InPersonwc = ADHD_numeric * inper_wc,
+    ADHD_x_Alonewc = ADHD_numeric * alone_wc,
+    ADHD_x_weekend = ADHD_numeric * weekend,
     ADHD_x_log_dt = ADHD_numeric * log_dt
   )
 
@@ -506,7 +536,7 @@ brms_dat_ar2 <- ema_data %>%
   ungroup() %>%
   filter(
     !is.na(Y1_lag),  !is.na(Y2_lag),
-    !is.na(Y1_lag2), !is.na(Y2_lag2),   # ← KEY: require 2nd lag
+    !is.na(Y1_lag2), !is.na(Y2_lag2),   
     !is.na(Y1),      !is.na(Y2),
     !is.na(dt),      dt > 0
   ) %>%
@@ -516,7 +546,7 @@ brms_dat_ar2 <- ema_data %>%
   )
 
 # ============================================================================
-# 14. DEFINE brms MULTIVARIATE VAR(1) MODEL (with weekend)
+# 14. DEFINE brms MULTIVARIATE VAR(1) MODEL 
 # ============================================================================
 
 # ============================================================================
@@ -543,14 +573,14 @@ fit_ar1 <- brm(
   iter    = 4000,
   warmup  = 2000,
   seed    = 42,
-  control = list(adapt_delta = 0.95, max_treedepth = 12)
+  control = list(adapt_delta = 0.95, max_treedepth = 12),
+  backend = "cmdstanr",
+  file = "./data/ar1.RDS"
 )
-
 
 # ============================================================================
 # 14b. AR(2) MODEL
 # ============================================================================
-
 bf_Y1_ar2 <- bf(
   Y1 ~ 1 +
     # ── AR(1) + AR(2) lags ──
@@ -571,8 +601,10 @@ fit_ar2 <- brm(
   chains  = 4,
   iter    = 4000,
   warmup  = 2000,
-  seed    = 42,
-  control = list(adapt_delta = 0.95, max_treedepth = 12)
+  seed    = 16,
+  control = list(adapt_delta = 0.95, max_treedepth = 12),
+  backend = "cmdstanr",
+  file = "./data/ar2.RDS"
 )
 
 # ============================================================================
@@ -599,17 +631,17 @@ se_diff    <- loo_comp[2, "se_diff"]
 bf_Y1 <- bf(
   Y1 ~ 1 +
     # Temporal dynamics
-    Y1_lag + Y2_lag +
+    Y1_lag_wc + Y2_lag_wc +
     # Between-person
-    ADHD_numeric +
+    ADHD_numeric + Y1_pm + Y2_pm +
     # ADHD moderates dynamics
-    Y1_lag:ADHD_numeric + Y2_lag:ADHD_numeric +
+    Y1_lag_wc:ADHD_numeric + Y2_lag_wc:ADHD_numeric +
     # Social context
     SocialMedia + InPerson + Alone +
     # ADHD × Context
     ADHD_x_SocialMedia + ADHD_x_InPerson + ADHD_x_Alone +
     # ── Weekend ──
-    weekend +
+    weekend + ADHD_x_weekend +
     # Internalizing
     C_SCARED_Score +
     # Extern
@@ -619,32 +651,482 @@ bf_Y1 <- bf(
     # Spacing correction
     log_dt + log_dt:ADHD_numeric +
     # Random effects
-    (1 + Y2_lag + Y1_lag + log_dt | p | person_id)
+    (1 + Y2_lag_wc + Y1_lag_wc + log_dt | p | person_id)
 ) + gaussian()
 
 bf_Y2 <- bf(
   Y2 ~ 1 +
-    Y1_lag + Y2_lag +
-    ADHD_numeric +
-    Y1_lag:ADHD_numeric + Y2_lag:ADHD_numeric +
+    Y1_lag_wc + Y2_lag_wc +
+    ADHD_numeric + Y1_pm + Y2_pm +
+    Y1_lag_wc:ADHD_numeric + Y2_lag_wc:ADHD_numeric +
     SocialMedia + InPerson + Alone +
     ADHD_x_SocialMedia + ADHD_x_InPerson + ADHD_x_Alone +
-    weekend  +
+    weekend  + ADHD_x_weekend +
     C_SCARED_Score +
     DBD_Cp_Scr +
     Age +
     log_dt + log_dt:ADHD_numeric +
-    (1 + Y2_lag + Y1_lag + log_dt | p | person_id)
+    (1 + Y2_lag_wc + Y1_lag_wc + log_dt | p | person_id)
 ) + gaussian()
 
 fit_brms <- brm(
   bf_Y1 + bf_Y2 + set_rescor(TRUE),
   data    = brms_dat,
-  prior   = model_priors,
   cores   = 4,
   chains  = 4,
   iter    = 4000,
   warmup  = 2000,
-  seed    = 42,
-  control = list(adapt_delta = 0.95, max_treedepth = 12)
+  seed    = 16,
+  backend = "cmdstanr",
+  control = list(adapt_delta = 0.95, max_treedepth = 12),
+  file = "./data/rawBinaryVars.RDS"
 )
+
+# ============================================================================
+# 15b. FIT THE MODEL -- Centered Social Shocks
+# ============================================================================
+bf_Y1 <- bf(
+  Y1 ~ 1 +
+    # Temporal dynamics
+    Y1_lag_wc + Y2_lag_wc +
+    alone_pm + inper_pm + socia_pm +
+    # Between-person
+    ADHD_numeric + Y1_pm + Y2_pm +
+    # ADHD moderates dynamics
+    Y1_lag_wc:ADHD_numeric + Y2_lag_wc:ADHD_numeric +
+    # Social context
+    socia_wc + inper_wc + alone_wc +
+    # ADHD × Context
+    ADHD_x_SocialMediawc + ADHD_x_InPersonwc + ADHD_x_Alonewc +
+    # ── Weekend ──
+    weekend + ADHD_x_weekend +
+    # Internalizing
+    C_SCARED_Score +
+    # Extern
+    DBD_Cp_Scr +
+    # Age
+    Age +
+    # Spacing correction
+    log_dt + log_dt:ADHD_numeric +
+    log_dt:Y1_lag_wc + log_dt:Y2_lag_wc + 
+    log_dt:ADHD_numeric:Y1_lag_wc + log_dt:ADHD_numeric:Y2_lag_wc +
+    # Random effects
+    (1 + Y2_lag_wc + Y1_lag_wc + log_dt | p | person_id)
+) + gaussian()
+bf_Y2 <- bf(
+  Y2 ~ 1 +
+    Y1_lag_wc + Y2_lag_wc +
+    alone_pm + inper_pm + socia_pm +
+    ADHD_numeric + Y1_pm + Y2_pm +
+    Y1_lag_wc:ADHD_numeric + Y2_lag_wc:ADHD_numeric +
+    socia_wc + inper_wc + alone_wc +
+    ADHD_x_SocialMediawc + ADHD_x_InPersonwc + ADHD_x_Alonewc +
+    weekend + ADHD_x_weekend +
+    C_SCARED_Score +
+    DBD_Cp_Scr +
+    Age +
+    log_dt + log_dt:ADHD_numeric +
+    log_dt:Y1_lag_wc + log_dt:Y2_lag_wc + 
+    log_dt:ADHD_numeric:Y1_lag_wc + log_dt:ADHD_numeric:Y2_lag_wc +
+    (1 + Y2_lag_wc + Y1_lag_wc + log_dt | p | person_id)
+) + gaussian()
+fit_brms2 <- brm(
+  bf_Y1 + bf_Y2 + set_rescor(TRUE),
+  data = brms_dat,
+  cores   = 4,
+  chains  = 4,
+  iter    = 4000,
+  warmup  = 2000,
+  seed    = 16,
+  control = list(adapt_delta = 0.97, max_treedepth = 18),
+  backend = "cmdstanr",
+  file = "./data/scaledBinaryVars22-ARCRLagSpace2.RDS"
+)
+
+## Prepare the output table
+sum_vals <- summary(fit_brms2)$fixed
+
+# Flag rows where the CI excludes 0 (lower and upper have the same sign)
+lower <- sum_vals[["l-95% CI"]]
+upper <- sum_vals[["u-95% CI"]]
+sig   <- lower > 0 | upper < 0
+
+# Format helper (change digits as needed)
+fmt <- function(x, digits = 3) formatC(x, format = "f", digits = digits)
+
+# Build the output table
+out_tab <- data.frame(
+  Parameter = rownames(sum_vals),
+  `Estimate {95% CI}` = paste0(
+    fmt(sum_vals$Estimate), ifelse(sig, "*", ""),
+    " [", fmt(lower), ", ", fmt(upper), "]"
+  ),
+  `SE` = fmt(sum_vals$Est.Error),
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+## NOw split so Y1 variables on the left and Y2 on the right
+out_tab_Y1 = out_tab[grep(x = out_tab$Parameter, pattern = "^Y1_"),]
+out_tab_Y2 = out_tab[grep(x = out_tab$Parameter, pattern = "^Y2_"),]
+## NOw cbind these?
+to_write = bind_cols(out_tab_Y1, out_tab_Y2)
+write.table(x = to_write, file = "./data/outputPretty.csv", 
+            quote = F, row.names = F, sep ="\t")
+
+
+# ============================================================================
+# 16. PLOT EMM FROM SOCIAL VARS
+# ============================================================================
+library(emmeans)
+
+# Outcome Y1 (Hostile)
+inper_y1_0     <- emmeans(fit_brms2, ~ inper_wc, at = list(inper_wc = c(-1, 0, 1), ADHD_x_InPersonwc = 0, ADHD_numeric = 0), resp = "Y1")
+inper_y1_1_neg <- emmeans(fit_brms2, ~ inper_wc, at = list(inper_wc = -1, ADHD_x_InPersonwc = -1, ADHD_numeric = 1), resp = "Y1")
+inper_y1_1_zer <- emmeans(fit_brms2, ~ inper_wc, at = list(inper_wc = 0,  ADHD_x_InPersonwc = 0,  ADHD_numeric = 1), resp = "Y1")
+inper_y1_1_pos <- emmeans(fit_brms2, ~ inper_wc, at = list(inper_wc = 1,  ADHD_x_InPersonwc = 1,  ADHD_numeric = 1), resp = "Y1")
+
+# Outcome Y2 (Prosocial)
+inper_y2_0     <- emmeans(fit_brms2, ~ inper_wc, at = list(inper_wc = c(-1, 0, 1), ADHD_x_InPersonwc = 0, ADHD_numeric = 0), resp = "Y2")
+inper_y2_1_neg <- emmeans(fit_brms2, ~ inper_wc, at = list(inper_wc = -1, ADHD_x_InPersonwc = -1, ADHD_numeric = 1), resp = "Y2")
+inper_y2_1_zer <- emmeans(fit_brms2, ~ inper_wc, at = list(inper_wc = 0,  ADHD_x_InPersonwc = 0,  ADHD_numeric = 1), resp = "Y2")
+inper_y2_1_pos <- emmeans(fit_brms2, ~ inper_wc, at = list(inper_wc = 1,  ADHD_x_InPersonwc = 1,  ADHD_numeric = 1), resp = "Y2")
+
+# ==========================================
+# 2. SOCIAL MEDIA SETTING (Values: -1, 0, 1)
+# ==========================================
+# Outcome Y1 (Hostile)
+socia_y1_0     <- emmeans(fit_brms2, ~ socia_wc, at = list(socia_wc = c(-1, 0, 1), ADHD_x_SocialMediawc = 0, ADHD_numeric = 0), resp = "Y1")
+socia_y1_1_neg <- emmeans(fit_brms2, ~ socia_wc, at = list(socia_wc = -1, ADHD_x_SocialMediawc = -1, ADHD_numeric = 1), resp = "Y1")
+socia_y1_1_zer <- emmeans(fit_brms2, ~ socia_wc, at = list(socia_wc = 0,  ADHD_x_SocialMediawc = 0,  ADHD_numeric = 1), resp = "Y1")
+socia_y1_1_pos <- emmeans(fit_brms2, ~ socia_wc, at = list(socia_wc = 1,  ADHD_x_SocialMediawc = 1,  ADHD_numeric = 1), resp = "Y1")
+
+# Outcome Y2 (Prosocial)
+socia_y2_0     <- emmeans(fit_brms2, ~ socia_wc, at = list(socia_wc = c(-1, 0, 1), ADHD_x_SocialMediawc = 0, ADHD_numeric = 0), resp = "Y2")
+socia_y2_1_neg <- emmeans(fit_brms2, ~ socia_wc, at = list(socia_wc = -1, ADHD_x_SocialMediawc = -1, ADHD_numeric = 1), resp = "Y2")
+socia_y2_1_zer <- emmeans(fit_brms2, ~ socia_wc, at = list(socia_wc = 0,  ADHD_x_SocialMediawc = 0,  ADHD_numeric = 1), resp = "Y2")
+socia_y2_1_pos <- emmeans(fit_brms2, ~ socia_wc, at = list(socia_wc = 1,  ADHD_x_SocialMediawc = 1,  ADHD_numeric = 1), resp = "Y2")
+
+# ==========================================
+# 3. ALONE SETTING (Values: -1, 0, 1)
+# ==========================================
+# Outcome Y1 (Hostile)
+alone_y1_0     <- emmeans(fit_brms2, ~ alone_wc, at = list(alone_wc = c(-1, 0, 1), ADHD_x_Alonewc = 0, ADHD_numeric = 0), resp = "Y1")
+alone_y1_1_neg <- emmeans(fit_brms2, ~ alone_wc, at = list(alone_wc = -1, ADHD_x_Alonewc = -1, ADHD_numeric = 1), resp = "Y1")
+alone_y1_1_zer <- emmeans(fit_brms2, ~ alone_wc, at = list(alone_wc = 0,  ADHD_x_Alonewc = 0,  ADHD_numeric = 1), resp = "Y1")
+alone_y1_1_pos <- emmeans(fit_brms2, ~ alone_wc, at = list(alone_wc = 1,  ADHD_x_Alonewc = 1,  ADHD_numeric = 1), resp = "Y1")
+
+# Outcome Y2 (Prosocial)
+alone_y2_0     <- emmeans(fit_brms2, ~ alone_wc, at = list(alone_wc = c(-1, 0, 1), ADHD_x_Alonewc = 0, ADHD_numeric = 0), resp = "Y2")
+alone_y2_1_neg <- emmeans(fit_brms2, ~ alone_wc, at = list(alone_wc = -1, ADHD_x_Alonewc = -1, ADHD_numeric = 1), resp = "Y2")
+alone_y2_1_zer <- emmeans(fit_brms2, ~ alone_wc, at = list(alone_wc = 0,  ADHD_x_Alonewc = 0,  ADHD_numeric = 1), resp = "Y2")
+alone_y2_1_pos <- emmeans(fit_brms2, ~ alone_wc, at = list(alone_wc = 1,  ADHD_x_Alonewc = 1,  ADHD_numeric = 1), resp = "Y2")
+
+# ==========================================
+# 4. COMBINE 
+# ==========================================
+df_inper <- bind_rows(
+  as.data.frame(inper_y1_0)     %>% mutate(Outcome = "Hostile", Group = "Control"),
+  as.data.frame(inper_y1_1_neg) %>% mutate(Outcome = "Hostile", Group = "ADHD"),
+  as.data.frame(inper_y1_1_zer) %>% mutate(Outcome = "Hostile", Group = "ADHD"),
+  as.data.frame(inper_y1_1_pos) %>% mutate(Outcome = "Hostile", Group = "ADHD"),
+  as.data.frame(inper_y2_0)     %>% mutate(Outcome = "Prosocial", Group = "Control"),
+  as.data.frame(inper_y2_1_neg) %>% mutate(Outcome = "Prosocial", Group = "ADHD"),
+  as.data.frame(inper_y2_1_zer) %>% mutate(Outcome = "Prosocial", Group = "ADHD"),
+  as.data.frame(inper_y2_1_pos) %>% mutate(Outcome = "Prosocial", Group = "ADHD")
+) %>% rename(Setting_Val = 1) %>% mutate(Context = "In-Person")
+
+df_socia <- bind_rows(
+  as.data.frame(socia_y1_0)     %>% mutate(Outcome = "Hostile", Group = "Control"),
+  as.data.frame(socia_y1_1_neg) %>% mutate(Outcome = "Hostile", Group = "ADHD"),
+  as.data.frame(socia_y1_1_zer) %>% mutate(Outcome = "Hostile", Group = "ADHD"),
+  as.data.frame(socia_y1_1_pos) %>% mutate(Outcome = "Hostile", Group = "ADHD"),
+  as.data.frame(socia_y2_0)     %>% mutate(Outcome = "Prosocial", Group = "Control"),
+  as.data.frame(socia_y2_1_neg) %>% mutate(Outcome = "Prosocial", Group = "ADHD"),
+  as.data.frame(socia_y2_1_zer) %>% mutate(Outcome = "Prosocial", Group = "ADHD"),
+  as.data.frame(socia_y2_1_pos) %>% mutate(Outcome = "Prosocial", Group = "ADHD")
+) %>% rename(Setting_Val = 1) %>% mutate(Context = "Social Media")
+
+df_alone <- bind_rows(
+  as.data.frame(alone_y1_0)     %>% mutate(Outcome = "Hostile", Group = "Control"),
+  as.data.frame(alone_y1_1_neg) %>% mutate(Outcome = "Hostile", Group = "ADHD"),
+  as.data.frame(alone_y1_1_zer) %>% mutate(Outcome = "Hostile", Group = "ADHD"),
+  as.data.frame(alone_y1_1_pos) %>% mutate(Outcome = "Hostile", Group = "ADHD"),
+  as.data.frame(alone_y2_0)     %>% mutate(Outcome = "Prosocial", Group = "Control"),
+  as.data.frame(alone_y2_1_neg) %>% mutate(Outcome = "Prosocial", Group = "ADHD"),
+  as.data.frame(alone_y2_1_zer) %>% mutate(Outcome = "Prosocial", Group = "ADHD"),
+  as.data.frame(alone_y2_1_pos) %>% mutate(Outcome = "Prosocial", Group = "ADHD")
+) %>% rename(Setting_Val = 1) %>% mutate(Context = "Alone")
+
+plot_data <- bind_rows(df_inper, df_socia, df_alone) %>%
+  mutate(Setting_Val = factor(Setting_Val),
+         Context = factor(Context, levels = c("Social Media", "In-Person", "Alone")))
+
+# ==========================================
+# 5. PLOT
+# ==========================================
+fig_3 = ggplot(
+  plot_data, 
+  aes(x = Setting_Val, y = emmean, fill = Group)
+) +
+  geom_col(
+    position = position_dodge(width = 0.8), 
+    width = 0.7, 
+    color = "black", 
+    linewidth = 0.3
+  ) +
+  geom_errorbar(
+    aes(ymin = lower.HPD, ymax = upper.HPD), 
+    position = position_dodge(width = 0.8), 
+    width = 0.2,
+    linewidth = 0.5
+  ) +
+  facet_grid(Outcome ~ Context, scales = "free_y") +
+  labs(
+    #title = "Estimated Marginal Means Across Social Settings & ADHD Status",
+    #subtitle = "Comparing Levels (-1, 0, 1) Within Each Social Category for Hostile and Prosocial Outcomes",
+    x = "Person-mean Social Setting Level",
+    y = "Predicted Within-person Deviations",
+    fill = "ADHD Status"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 12),
+    panel.spacing = unit(1.5, "lines")
+  ) +
+  scale_fill_manual(values = c("Control" = "#4575b4", "ADHD" = "#d73027"))
+
+ggsave(filename = "figure_3.png", plot = fig_3,
+       dpi = 300, height = 8, width = 8)
+
+
+
+# ============================================================================
+# 17. MODEL CONVERGENCE
+# ============================================================================
+rhat_vals <- brms::rhat(fit_brms2)
+
+# 2. Convert to a data frame for ggplot2
+rhat_df <- data.frame(rhat = rhat_vals)
+
+# 3. Plot a histogram of the R-hat values
+plot = ggplot(rhat_df, aes(x = rhat)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 1.05, color = "red", linetype = "dashed") +
+  labs(
+    title = "Histogram of R-hat Convergence Diagnostics",
+    x = "R-hat Value",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+ggsave(filename = "./data/out_rhat_example.png", plot = plot, 
+       width = 7, height = 4, dpi = 300)
+
+plot = mcmc_trace(fit_brms2, pars = vars(starts_with("b_Y1_Y1_lag_wc")))
+ggsave(filename = "./data/out_trace_example.png", plot = plot, 
+       width = 7, height = 4, dpi = 300)
+
+plot = mcmc_acf(fit_brms2, pars = vars(starts_with("b_Y1_Y1_lag_wc")))
+ggsave(filename = "./data/out_acf_example.png", plot = plot, 
+       width = 7, height = 4, dpi = 300)
+
+# 1. Compute both Bulk and Tail ESS using bayestestR
+ess_summary <- bayestestR::effective_sample(fit_brms2)
+
+# 2. Reshape 
+ess_df <- ess_summary %>%
+  pivot_longer(
+    cols = c(ESS, ESS_tail), 
+    names_to = "ESS_Type", 
+    values_to = "ESS_Value"
+  ) %>%
+  mutate(ESS_Type = gsub("ESS_", "", ESS_Type))
+
+# 3. Plot facetted histograms
+plot = ggplot(ess_df, aes(x = ESS_Value, fill = ESS_Type)) +
+  geom_histogram(bins = 30, color = "white", show.legend = FALSE) +
+  facet_wrap(~ ESS_Type, scales = "free_x") +
+  scale_fill_manual(values = c("Bulk" = "steelblue", "Tail" = "darkorange")) +
+  geom_vline(xintercept = 400, color = "red", linetype = "dashed") +
+  labs(
+    title = "Histograms of Bulk and Tail Effective Sample Size (ESS)",
+    x = "Effective Sample Size Value",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+ggsave(filename = "./data/out_ess_example.png", plot = plot, 
+       width = 7, height = 4, dpi = 300)
+
+
+
+# ============================================================================
+# 17. RANDOM EFFECT VCOV MATRIX
+# ============================================================================
+
+# 1. EXTRACT VCOV
+vc <- VarCorr(fit_brms2, summary = TRUE)$person_id
+
+# Correct indexing: [row, statistic, col]
+est_mat <- vc$cor[, "Estimate", ]
+lo_mat  <- vc$cor[, "Q2.5",     ]
+hi_mat  <- vc$cor[, "Q97.5",    ]
+
+cat("Correlation matrix (posterior means):\n")
+print(round(est_mat, 2))
+
+# 2. ORGANIZE
+param_order <- c(
+  "Y1_Intercept",
+  "Y1_Y1_lag_wc",
+  "Y1_Y2_lag_wc",
+  "Y1_log_dt",
+  "Y2_Intercept",
+  "Y2_Y1_lag_wc",
+  "Y2_Y2_lag_wc",
+  "Y2_log_dt"
+)
+
+clean_labels <- c(
+  "Y1_Intercept"  = "HOS\nIntercept",
+  "Y1_Y1_lag_wc"  = "HOS\nAR",
+  "Y1_Y2_lag_wc"  = "HOS←PS\nCL",
+  "Y1_log_dt"     = "HOS\nlog Δt",
+  "Y2_Intercept"  = "PS\nIntercept",
+  "Y2_Y1_lag_wc"  = "PS←HOS\nCL",
+  "Y2_Y2_lag_wc"  = "PS\nAR",
+  "Y2_log_dt"     = "PS\nlog Δt"
+)
+
+n <- length(param_order)
+
+# Reorder matrices to match param_order
+est_mat <- est_mat[param_order, param_order]
+lo_mat  <- lo_mat[param_order,  param_order]
+hi_mat  <- hi_mat[param_order,  param_order]
+
+# EXTRACT SD
+sd_vec  <- vc$sd[param_order, "Estimate"]
+var_vec <- sd_vec
+
+cat("\nVariances (SD²):\n")
+print(round(var_vec, 4))
+
+# ORGANIZE MAT
+display_mat <- est_mat
+diag(display_mat) <- var_vec
+
+# Credibility: 95% BCI excludes zero (off-diagonal only)
+cred_mat <- (lo_mat > 0 | hi_mat < 0)
+diag(cred_mat) <- FALSE
+
+# RESHAPE
+label_vec <- clean_labels[param_order]
+
+mat_long <- expand.grid(
+  row_idx = seq_len(n),
+  col_idx = seq_len(n)
+) %>%
+  mutate(
+    row_lab  = factor(label_vec[row_idx], levels = rev(label_vec)),
+    col_lab  = factor(label_vec[col_idx], levels = label_vec),
+    value    = mapply(function(r, c) display_mat[r, c], row_idx, col_idx),
+    is_diag  = row_idx == col_idx,
+    credible = mapply(function(r, c) cred_mat[r, c], row_idx, col_idx),
+    text_val = case_when(
+      is_diag ~ sprintf("%.2f", value),
+      TRUE    ~ sprintf("%.2f",     value)
+    ),
+    text_col = case_when(
+      is_diag          ~ "grey20",
+      abs(value) > 0.5 ~ "white",
+      TRUE             ~ "grey15"
+    ),
+    text_face = ifelse(credible, "bold", "plain")
+  )
+
+# PLOT
+p <- ggplot(mat_long, aes(x = col_lab, y = row_lab)) +
+  
+  # Off-diagonal: correlation fill
+  geom_tile(
+    data  = filter(mat_long, !is_diag),
+    aes(fill = value),
+    color = "white", linewidth = 0.7
+  ) +
+  geom_tile(
+    data  = filter(mat_long, is_diag),
+    aes(fill = value),
+    #fill  = "#DCDCDC",
+    color = "white",
+    linewidth = 0.7
+  ) +
+  scale_fill_gradient2(
+    low      = "#2166AC",
+    mid      = "#F7F7F7",
+    high     = "#D6604D",
+    midpoint = 0,
+    limits   = c(-1, 1),
+    name     = "Posterior mean correlation",
+    guide    = guide_colorbar(
+      barwidth       = 10,
+      barheight      = 0.8,
+      title.position = "top",
+      title.hjust    = 0.5
+    )
+  ) +
+  
+  geom_text(
+    aes(label = text_val, colour = text_col),
+    size       = 6.0,
+    lineheight = 0.85,
+    fontface   = mat_long$text_face
+  ) +
+  scale_colour_identity() +
+  
+  # Credibility star
+  geom_text(
+    data    = filter(mat_long, credible),
+    aes(label = "✶"),
+    colour  = "black",
+    size    = 4.5,
+    nudge_x =  0.37,
+    nudge_y =  0.33
+  ) +
+  
+  # Block dividers between Y1 and Y2 groups
+  geom_hline(yintercept = 4.5, linewidth = 1.1, colour = "grey25") +
+  geom_vline(xintercept = 4.5, linewidth = 1.1, colour = "grey25") +
+  
+  # Equation block labels
+  annotate("text", x = 2.5, y = n + 0.9,
+           label    = "Hostile Equation",
+           fontface = "bold", size = 3.6, colour = "grey20") +
+  annotate("text", x = 6.5, y = n + 0.9,
+           label    = "Prosocial Equation",
+           fontface = "bold", size = 3.6, colour = "grey20") +
+  
+  coord_cartesian(clip = "off") +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    axis.text.x     = element_text(size = 12,  colour = "grey20",
+                                   lineheight = 0.85),
+    axis.text.y     = element_text(size = 12,  colour = "grey20",
+                                   lineheight = 0.85),
+    panel.grid      = element_blank(),
+    legend.position = "bottom",
+    plot.title      = element_text(face = "bold", size = 13),
+    plot.subtitle   = element_text(size = 9, colour = "grey45"),
+    plot.margin     = margin(28, 10, 10, 10)
+  )
+
+print(p)
+
+ggsave("plot_random_effect_cormat_v3.png", p,
+       width = 8, height = 8.5, dpi = 200, bg = "white")
